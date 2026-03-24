@@ -36,7 +36,7 @@ CLOSE_SWIPE_TIME_WINDOW = 0.5
 CLOSE_SWIPE_COOLDOWN = 2.0
 
 # Scroll settings
-SCROLL_AMOUNT = 3
+SCROLL_AMOUNT = 50
 SCROLL_SPEED = 0.02
 BOTTOM_THIRD = 0.66
 
@@ -136,7 +136,7 @@ tray_thread = threading.Thread(target=run_tray, daemon=True)
 tray_thread.start()
 
 recognizer = sr.Recognizer()
-microphone = sr.Microphone(device_index=3)
+microphone = sr.Microphone(device_index=2)
 voice_thread = threading.Thread(
     target=listen_for_commands,
     args=(recognizer, microphone, VOICE_COMMANDS),
