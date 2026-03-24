@@ -9,6 +9,7 @@ import pystray
 import pyautogui
 import webbrowser
 from PIL import Image, ImageDraw
+import speech_recognition as sr
 
 # --- Configuration ---
 WEBCAM_INDEX = 0
@@ -17,7 +18,6 @@ HOLD_SECONDS = 1.5
 # Left hand paths
 GAME_PATH = r"C:\Program Files\GRYPHLINK\games\EndField Game\Endfield.exe"
 MP3_PATH = r"C:\Users\chuon\Downloads\Fun Vscode\EndfieldHandTracker\RIPMG.mp3"
-# DISCORD_PATH = r"C:\Users\chuon\AppData\Local\Discord\Update.exe"
 OPERA_PATH = r"C:\Users\chuon\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Opera GX Browser.lnk"
 
 # Right hand paths
@@ -36,15 +36,21 @@ CLOSE_SWIPE_TIME_WINDOW = 0.5
 CLOSE_SWIPE_COOLDOWN = 2.0
 
 # Scroll settings
-SCROLL_AMOUNT = 100  # Pixels to scroll per tick
-SCROLL_SPEED = 0.02  # Seconds between each scroll tick
-BOTTOM_THIRD = 0.66  # Y threshold for bottom third of webcam
+SCROLL_AMOUNT = 3
+SCROLL_SPEED = 0.02
+BOTTOM_THIRD = 0.66
+
+# --- Voice Commands ---
+VOICE_COMMANDS = {
+    "67": r"C:\Users\chuon\curseforge\minecraft\Install\minecraft.exe",
+    # "open chrome": r"C:\Path\To\chrome.exe",
+}
 
 # --- MediaPipe Setup ---
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
-    max_num_hands=2,  # Now tracking both hands
+    max_num_hands=2,
     min_detection_confidence=0.7,
     min_tracking_confidence=0.7
 )
@@ -65,7 +71,45 @@ def count_fingers(hand_landmarks):
             fingers_up += 1
     return fingers_up
 
-# --- System Tray Setup ---
+def wait_for_hand_exit(cap, hands, window_name):
+    while True:
+        s, f = cap.read()
+        if not s:
+            continue
+        f = cv2.flip(f, 1)
+        r = hands.process(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+        cv2.imshow(window_name, f)
+        cv2.waitKey(1)
+        if not r.multi_hand_landmarks:
+            break
+
+def listen_for_commands(recognizer, microphone, commands):
+    with microphone as source:
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+        recognizer.energy_threshold = 300
+        recognizer.pause_threshold = 1.0
+    print("🎤 Voice recognition ready!")
+    while True:
+        try:
+            with microphone as source:
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=6)
+            phrase = recognizer.recognize_google(audio).lower()
+            print(f"🎤 Heard: '{phrase}'")
+            for command, path in commands.items():
+                if command in phrase:
+                    print(f"✅ Matched: '{command}' → launching!")
+                    subprocess.Popen(path, shell=True)
+                    break
+        except sr.WaitTimeoutError:
+            pass
+        except sr.UnknownValueError:
+            pass
+        except sr.RequestError as e:
+            print(f"❌ Speech error: {e}")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+
+# --- System Tray ---
 def create_tray_icon():
     img = Image.new("RGB", (64, 64), color=(30, 30, 30))
     draw = ImageDraw.Draw(img)
@@ -91,45 +135,38 @@ def run_tray():
 tray_thread = threading.Thread(target=run_tray, daemon=True)
 tray_thread.start()
 
+recognizer = sr.Recognizer()
+microphone = sr.Microphone(device_index=3)
+voice_thread = threading.Thread(
+    target=listen_for_commands,
+    args=(recognizer, microphone, VOICE_COMMANDS),
+    daemon=True
+)
+voice_thread.start()
+
 # --- Main Loop Setup ---
 cap = cv2.VideoCapture(WEBCAM_INDEX, cv2.CAP_DSHOW)
 time.sleep(1)
 
 if not cap.isOpened():
-    print("❌ Could not open webcam at index 0.")
+    print("❌ Could not open webcam.")
     os._exit(1)
 
 # Left hand state
 L_gesture_start_time = None
 L_fist_start_time = None
-L_swipe_start_y = None
-L_swipe_start_time = None
 L_close_swipe_start_x = None
 L_close_swipe_start_time = None
-L_last_swipe_time = 0
-L_last_opera_time = 0
 L_last_close_time = 0
+L_last_opera_time = 0
 vlc_player = None
+last_scroll_time = 0  # ← was missing before!
 
 # Right hand state
 R_gesture_start_time = None
 R_close_swipe_start_x = None
 R_close_swipe_start_time = None
 R_last_close_time = 0
-R_last_solidworks_time = 0
-
-def wait_for_hand_exit(cap, hands, window_name):
-    """Wait until hand leaves frame before re-enabling gestures."""
-    while True:
-        s, f = cap.read()
-        if not s:
-            continue
-        f = cv2.flip(f, 1)
-        r = hands.process(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
-        cv2.imshow(window_name, f)
-        cv2.waitKey(1)
-        if not r.multi_hand_landmarks:
-            break
 
 while True:
     success, img = cap.read()
@@ -142,7 +179,6 @@ while True:
 
     now = time.time()
 
-    # --- Parse both hands ---
     left_count = None
     right_count = None
     left_landmarks = None
@@ -151,10 +187,9 @@ while True:
     if result.multi_hand_landmarks and result.multi_handedness:
         for hand_lms, handedness in zip(result.multi_hand_landmarks, result.multi_handedness):
             mp_draw.draw_landmarks(img, hand_lms, mp_hands.HAND_CONNECTIONS)
-            label = handedness.classification[0].label  # "Left" or "Right"
+            label = handedness.classification[0].label
             count = count_fingers(hand_lms)
-            # Note: MediaPipe labels are mirrored since we flip the image
-            if label == "Left":  # Appears as left hand on screen
+            if label == "Left":
                 left_count = count
                 left_landmarks = hand_lms
             else:
@@ -165,10 +200,9 @@ while True:
     if left_count is None:
         L_gesture_start_time = None
         L_fist_start_time = None
-        L_swipe_start_y = None
-        L_swipe_start_time = None
         L_close_swipe_start_x = None
         L_close_swipe_start_time = None
+        last_scroll_time = 0
 
     if right_count is None:
         R_gesture_start_time = None
@@ -179,41 +213,6 @@ while True:
     # LEFT HAND GESTURES
     # =====================
 
-    # --- LEFT: 1 finger swipe down → Discord ---
-    # if left_count == 1 and left_landmarks is not None:
-    #     index_tip_y = left_landmarks.landmark[8].y
-    #     if L_swipe_start_y is None:
-    #         L_swipe_start_y = index_tip_y
-    #         L_swipe_start_time = now
-    #     else:
-    #         delta_y = index_tip_y - L_swipe_start_y
-    #         elapsed = now - L_swipe_start_time
-    #         if elapsed <= SWIPE_TIME_WINDOW:
-    #             if delta_y >= SWIPE_THRESHOLD and (now - L_last_swipe_time) > SWIPE_COOLDOWN:
-    #                 print("💬 Opening Discord!")
-    #                 subprocess.Popen([DISCORD_PATH, "--processStart", "Discord.exe"])
-    #                 L_last_swipe_time = now
-    #                 L_swipe_start_y = None
-    #                 L_swipe_start_time = None
-    #         else:
-    #             L_swipe_start_y = index_tip_y
-    #             L_swipe_start_time = now
-    # else:
-    #     L_swipe_start_y = None
-    #     L_swipe_start_time = None
-
-# --- LEFT: 2 fingers in bottom third → Scroll down ---
-    if left_count == 2 and left_landmarks is not None:
-            index_y = left_landmarks.landmark[8].y
-            if index_y > BOTTOM_THIRD:
-                if now - last_scroll_time > SCROLL_SPEED:
-                    pyautogui.scroll(-SCROLL_AMOUNT)  # Negative = scroll down
-                    last_scroll_time = now
-                cv2.putText(img, "📜 Scrolling Down...", (10, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 100), 3)
-    else:
-        last_scroll_time = 0
-        
     # --- LEFT: 5 fingers swipe right → Alt+F4 ---
     if left_count == 5 and left_landmarks is not None:
         wrist_x = left_landmarks.landmark[0].x
@@ -241,20 +240,16 @@ while True:
         L_close_swipe_start_x = None
         L_close_swipe_start_time = None
 
-   # --- LEFT: 3 fingers ---
+    # --- LEFT: 3 fingers top = Launch Arknights, bottom = Scroll Up ---
     if left_count == 3 and left_landmarks is not None:
         index_y = left_landmarks.landmark[8].y
-
-        # Bottom third = scroll up
         if index_y > BOTTOM_THIRD:
-            L_gesture_start_time = None  # Reset hold timer when scrolling
+            L_gesture_start_time = None
             if now - last_scroll_time > SCROLL_SPEED:
                 pyautogui.scroll(SCROLL_AMOUNT)
                 last_scroll_time = now
-            cv2.putText(img, "📜 Scrolling Up...", (10, 80),
+            cv2.putText(img, "Scrolling Up...", (10, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 100), 3)
-
-        # Top two thirds = Launch Arknights
         else:
             if L_gesture_start_time is None:
                 L_gesture_start_time = now
@@ -268,41 +263,14 @@ while True:
                 L_gesture_start_time = None
                 wait_for_hand_exit(cap, hands, "Arknights Endfield Launcher")
 
-    # --- LEFT: 2 fingers hold → Play MP3 ---
-    # elif left_count == 2:
-    #     if L_gesture_start_time is None:
-    #         L_gesture_start_time = now
-    #     elapsed = now - L_gesture_start_time
-    #     remaining = HOLD_SECONDS - elapsed
-    #     cv2.putText(img, f"L Hold... {remaining:.1f}s", (10, 80),
-    #                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 3)
-    #     if elapsed >= HOLD_SECONDS:
-    #         print("🎵 Playing MP3!")
-    #         if vlc_player is not None:
-    #             vlc_player.stop()
-    #         win_w, win_h = 640, 360
-    #         pos_x, pos_y = 640, 360
-    #         instance = vlc.Instance(
-    #             f"--width={win_w}",
-    #             f"--height={win_h}",
-    #             f"--video-x={pos_x}",
-    #             f"--video-y={pos_y}",
-    #         )
-    #         vlc_player = instance.media_player_new()
-    #         media = instance.media_new(MP3_PATH)
-    #         vlc_player.set_media(media)
-    #         vlc_player.play()
-    #         L_gesture_start_time = None
-    #         wait_for_hand_exit(cap, hands, "Arknights Endfield Launcher")
-
-    # --- LEFT: 2 fingers scroll down ---
+    # --- LEFT: 2 fingers bottom = Scroll Down ---
     elif left_count == 2 and left_landmarks is not None:
         index_y = left_landmarks.landmark[8].y
         if index_y > BOTTOM_THIRD:
             if now - last_scroll_time > SCROLL_SPEED:
                 pyautogui.scroll(-SCROLL_AMOUNT)
                 last_scroll_time = now
-            cv2.putText(img, "📜 Scrolling Down...", (10, 80),
+            cv2.putText(img, "Scrolling Down...", (10, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 100), 3)
         else:
             last_scroll_time = 0
@@ -323,16 +291,14 @@ while True:
             wait_for_hand_exit(cap, hands, "Arknights Endfield Launcher")
 
     else:
-        if left_count not in [1, None]:
-            L_gesture_start_time = None
-        if left_count != 0:
-            L_fist_start_time = None
+        L_gesture_start_time = None
+        L_fist_start_time = None
 
     # =====================
     # RIGHT HAND GESTURES
     # =====================
 
-    # --- RIGHT: 5 fingers swipe right → Open Gmail ---
+    # --- RIGHT: 5 fingers swipe left → Open Gmail ---
     if right_count == 5 and right_landmarks is not None:
         wrist_x = right_landmarks.landmark[0].x
         if R_close_swipe_start_x is None:
@@ -384,27 +350,26 @@ while True:
             wait_for_hand_exit(cap, hands, "Arknights Endfield Launcher")
 
     else:
-        if right_count not in [None]:
-            R_gesture_start_time = None
+        R_gesture_start_time = None
 
     # --- HUD Display ---
     cv2.putText(img, f"L: {left_count if left_count is not None else '-'}  R: {right_count if right_count is not None else '-'}",
                 (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 200), 3)
 
-    # Left hand legend (cyan)
     cv2.putText(img, "LEFT:", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 200), 2)
-    cv2.putText(img, "  1 finger swipe down = Discord", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.putText(img, "  2 fingers low = Scroll Down", (10, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.putText(img, "  3 fingers low = Scroll Up", (10, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.putText(img, "  3 fingers top = Launch Arknights", (10, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    # cv2.putText(img, "  2 fingers = Play MP3", (10, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, "  3 fingers top = Launch Arknights", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, "  3 fingers low = Scroll Up", (10, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, "  2 fingers low = Scroll Down", (10, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, "  Fist = Open Opera GX", (10, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     cv2.putText(img, "  5 fingers swipe right = Close App", (10, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
-    # Right hand legend (orange)
     cv2.putText(img, "RIGHT:", (10, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 150, 0), 2)
     cv2.putText(img, "  2 fingers = Open Website", (10, 275), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     cv2.putText(img, "  3 fingers = Launch SolidWorks", (10, 295), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.putText(img, "  5 fingers swipe right = Gmail", (10, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, "  5 fingers swipe left = Gmail", (10, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    cv2.putText(img, "Say 'six seven' = Minecraft", (10, 340),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 100), 1)
 
     cv2.imshow("Arknights Endfield Launcher", img)
     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -416,3 +381,27 @@ if vlc_player is not None:
 cap.release()
 cv2.destroyAllWindows()
 os._exit(0)
+
+# import speech_recognition as sr
+# import audioop
+
+# recognizer = sr.Recognizer()
+# microphone = sr.Microphone(device_index=3)
+
+# print("🎤 Mic level monitor — speak to see the bar move!")
+# print("Press Ctrl+C to stop\n")
+
+# with microphone as source:
+#     recognizer.adjust_for_ambient_noise(source, duration=1)
+#     print(f"Noise threshold set to: {recognizer.energy_threshold:.0f}\n")
+
+#     while True:
+#         try:
+#             buffer = source.stream.read(source.CHUNK)
+#             rms = audioop.rms(buffer, source.SAMPLE_WIDTH)
+#             level = int(rms / 100)
+#             bar = "█" * min(level, 50)
+#             print(f"\r🎙️  [{bar:<50}] {rms:>6}", end="", flush=True)
+#         except KeyboardInterrupt:
+#             print("\n\nStopped!")
+#             break
